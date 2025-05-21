@@ -1,143 +1,314 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.linalg import expm
 from scipy.integrate import solve_ivp
-from scipy.linalg import eigvals
-from itertools import combinations
-from scipy.linalg import svd
+import qutip
+from typing import List, Callable
 
-# Define Pauli matrices
-sigma_x = np.array([[0, 1], [1, 0]], dtype=complex)
-sigma_z = np.array([[1, 0], [0, -1]], dtype=complex)
+class QuantumRNN:
+    """
+    Quantum Recurrent Neural Network (QRNN) with:
+      - Hermitian Hamiltonian (decay, activation, beta-weighted interactions, input)
+      - Lindblad noise (amplitude damping + dephasing)
+      - Hybrid quantum-classical activation
+    """
+    def __init__(
+        self,
+        num_qubits: int,
+        delta: float,
+        alpha: float,
+        beta: float,
+        J: np.ndarray,
+        lambda_activation: float,
+        gamma_amp: float,
+        gamma_deph: float
+    ):
+        """
+        Args:
+            num_qubits: number of qubits
+            delta: decay rate
+            alpha: activation strength
+            beta: interaction strength multiplier
+            J: synaptic coupling matrix (NxN)
+            lambda_activation: slope for tanh activation
+            gamma_amp: amplitude damping rate
+            gamma_deph: dephasing rate
+        """
+        if J.shape != (num_qubits, num_qubits):
+            raise ValueError("J must be shape (num_qubits, num_qubits)")
+        self.N = num_qubits
+        self.delta = delta
+        self.alpha = alpha
+        self.beta = beta
+        self.J = J
+        self.lam = lambda_activation
+        self.gamma_amp = gamma_amp
+        self.gamma_deph = gamma_deph
 
-# Parameters for the quantum neural network
-alpha = 2.0  # self-dynamics coefficient
-beta = 0.5   # interaction coefficient
-N = 4        # Number of qubits
-hbar = 1.0   # Planck constant
-U_F = 1.5    # Scaling factor for self-interaction terms
-noise_strength = 0.01  # Magnitude of noise
+        # Single-qubit operators
+        self.sx = qutip.sigmax()
+        self.sy = qutip.sigmay()
+        self.sz = qutip.sigmaz()
+        self.sm = (self.sx - 1j*self.sy) / 2
+        self.sp = (self.sx + 1j*self.sy) / 2
 
-# Define time-dependent input as a step function
-def step_input(t, I_amplitude):
-    return I_amplitude if t >= 2.0 else 0.0
+    def _tensor_op(self, op: qutip.Qobj, idx: int) -> qutip.Qobj:
+        """Embed single-qubit op on qubit idx out of N."""
+        ops = [qutip.qeye(2)] * self.N
+        ops[idx] = op
+        return qutip.tensor(ops)
 
-# Construct the Hamiltonian
-def H(t, I_amplitude):
-    H = np.zeros((2**N, 2**N), dtype=complex)
+    def _get_hamiltonian(
+        self,
+        rho: qutip.Qobj,
+        inputs: np.ndarray
+    ) -> qutip.Qobj:
+        """Builds H(rho, inputs) at current time step."""
+        H = 0
 
-    # Base self-energy term: -sum(sigma_z)
+        # 1) Decay: -Δ ∑ σ_z^(i)
+        for i in range(self.N):
+            H -= self.delta * self._tensor_op(self.sz, i)
+
+        # 2) Activation: α ∑ tanh(λ ⟨σ_z^(i)⟩) · σ_z^(i)
+        exps = np.array([
+            qutip.expect(self._tensor_op(self.sz, i), rho)
+            for i in range(self.N)
+        ])
+        for i, m in enumerate(exps):
+            act = np.tanh(self.lam * m)
+            H += self.alpha * act * self._tensor_op(self.sz, i)
+
+        # 3) Interactions: β ∑_{i<j} J_ij σ_zᵢ ⊗ σ_zⱼ
+        for i in range(self.N):
+            for j in range(i+1, self.N):
+                H += self.beta * self.J[i, j] * \
+                     self._tensor_op(self.sz, i) * \
+                     self._tensor_op(self.sz, j)
+
+        # 4) Input: ∑ I_i · σ_x^(i)
+        for i in range(self.N):
+            H += inputs[i] * self._tensor_op(self.sx, i)
+
+        return H
+
+    def _lindblad(self, rho: qutip.Qobj) -> qutip.Qobj:
+        """Constructs the sum of Lindblad dissipators (amplitude damping + dephasing)."""
+        L = 0
+        for i in range(self.N):
+            # amplitude damping
+            L += self.gamma_amp * (
+                self._tensor_op(self.sm, i) * rho * self._tensor_op(self.sp, i)
+                - 0.5 * (
+                    self._tensor_op(self.sp*self.sm, i) * rho
+                    + rho * self._tensor_op(self.sp*self.sm, i)
+                  )
+            )
+            # pure dephasing
+            L += self.gamma_deph * (
+                self._tensor_op(self.sz, i) * rho * self._tensor_op(self.sz, i)
+                - rho
+            )
+        return L
+
+    def _rhs(
+        self,
+        t: float,
+        rho_vec: np.ndarray,
+        input_sequence: Callable[[float], np.ndarray]
+    ) -> np.ndarray:
+        """Right-hand side of the Lindblad master equation."""
+        rho = qutip.Qobj(
+            rho_vec.reshape((2**self.N, 2**self.N)),
+            dims=[[2]*self.N, [2]*self.N]
+        )
+        # Current inputs
+        inputs = input_sequence(t)
+        # Rebuild H using current rho & inputs
+        H = self._get_hamiltonian(rho, inputs)
+        # Coherent evolution
+        drho = -1j * (H * rho - rho * H)
+        # Dissipative part
+        drho += self._lindblad(rho)
+        return drho.full().flatten()
+
+    def evolve(
+        self,
+        rho0: qutip.Qobj,
+        time_points: np.ndarray,
+        input_sequence: Callable[[float], np.ndarray]
+    ) -> List[qutip.Qobj]:
+        """
+        Solves for ρ(t) at each time point under the full master equation,
+        then applies hybrid activation unitary at each step.
+        """
+        # Solve ODE
+        sol = solve_ivp(
+            fun=lambda t, y: self._rhs(t, y, input_sequence),
+            t_span=(time_points[0], time_points[-1]),
+            y0=rho0.full().flatten(),
+            t_eval=time_points,
+            method='RK45'
+        )
+        # Reconstruct Qobj states
+        states = [
+            qutip.Qobj(sol.y[:, idx].reshape((2**self.N, 2**self.N)),
+                        dims=[[2]*self.N, [2]*self.N])
+            for idx in range(sol.y.shape[1])
+        ]
+        # Hybrid activation: rotate each ρ by U_i(θ_i)
+        activated = []
+        for rho in states:
+            rho_a = rho.copy()
+            exps = np.array([
+                qutip.expect(self._tensor_op(self.sz, i), rho)
+                for i in range(self.N)
+            ])
+            for i, m in enumerate(exps):
+                theta = np.tanh(self.lam * m)
+                U = (-1j * theta * self._tensor_op(self.sx, i)).expm()
+                rho_a = U * rho_a * U.dag()
+            activated.append(rho_a)
+        return activated
+
+
+if __name__ == '__main__':
+    import matplotlib.pyplot as plt
+
+    # System parameters
+    N = 4
+    delta = 0.1
+    alpha = 1.0
+    beta = 0.1
+    lam_act = 1.0
+    gamma_amp = 0.01
+    gamma_deph = 0.02
+
+    # Random symmetric J with zero diagonal
+    np.random.seed(0)
+    J = np.random.uniform(-0.5, 0.5, (N, N))
+    J = 0.5 * (J + J.T)
+    np.fill_diagonal(J, 0)
+
+    # Initialize QRNN
+    qrnn = QuantumRNN(N, delta, alpha, beta, J, lam_act, gamma_amp, gamma_deph)
+
+    # Initial state |0...0><0...0|
+    psi0 = qutip.tensor([qutip.basis(2, 0)]*N)
+    rho0 = qutip.ket2dm(psi0)
+
+    # Time points
+    t_pts = np.linspace(0, 10, 200)
+
+    # Define time-dependent inputs
+    def inputs(t: float) -> np.ndarray:
+        return 0.1 * np.sin(0.5*t + np.arange(N))
+
+    # Evolve
+    results = qrnn.evolve(rho0, t_pts, inputs)
+
+    # Plot <σ_z> for each qubit
+    exp_z = np.zeros((len(t_pts), N))
+    for k, rho in enumerate(results):
+        exp_z[k, :] = [
+            qutip.expect(qrnn._tensor_op(qrnn.sz, i), rho)
+            for i in range(N)
+        ]
+
+    plt.figure(figsize=(8,4))
     for i in range(N):
-        H -= np.kron(np.eye(2**i), np.kron(sigma_z, np.eye(2**(N-i-1))))
+        plt.plot(t_pts, exp_z[:, i], label=f'Qubit {i+1}')
+    plt.xlabel('Time')
+    plt.ylabel(r'$\langle \sigma_z \rangle$')
+    plt.title('Quantum RNN Qubit Expectations')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
-    # Self-dynamics with U_F, scaled by alpha
-    for i in range(N):
-        H += alpha * U_F * np.kron(np.eye(2**i), np.kron(sigma_z, np.eye(2**(N-i-1))))
+# Plot <σ_x> for each qubit
+exp_x = np.zeros((len(t_pts), N))
+for k, rho in enumerate(results):
+    exp_x[k, :] = [qutip.expect(qrnn._tensor_op(qrnn.sx, i), rho)
+                    for i in range(N)]
 
-    # Interaction terms between qubits (scaled by beta)
-    for i in range(N):
-        for j in range(i+1, N):
-            interaction_term = np.kron(np.eye(2**i), np.kron(sigma_z, np.eye(2**(j-i-1))))
-            interaction_term = np.kron(interaction_term, np.kron(sigma_z, np.eye(2**(N-j-1))))
-            H -= beta * U_F * interaction_term
 
-    # External input applied via Pauli-X (with step function input)
-    for i in range(N):
-        H_input = step_input(t, I_amplitude)
-        H += H_input * np.kron(np.eye(2**i), np.kron(sigma_x, np.eye(2**(N-i-1))))
-
-    # Noise term
-    H += noise_strength * (np.random.rand(2**N, 2**N) - 0.5)
-
-    return H
-
-def time_evolution(t, psi_0, I_amplitude):
-    def schrodinger_eq(t, psi_flat):
-        psi = psi_flat.reshape((2**N, 1))
-        H_t = H(t, I_amplitude)
-        dpsi_dt = -1j / hbar * np.dot(H_t, psi)
-        return dpsi_dt.flatten()
-
-    sol = solve_ivp(schrodinger_eq, [0, t], psi_0.flatten(), t_eval=np.linspace(0, t, 100), method='RK45')
-    return sol.t, sol.y  # Return time series
-
-# Initial state (all qubits in |0> state)
-psi_0 = np.zeros((2**N, 1), dtype=complex)
-psi_0[0] = 1.0  # Initial state |000>
-
-# Solve the time evolution for a specific input amplitude
-I_amplitude = 2.0
-t_final = 5.0
-# Get the time evolution series
-time, psi_t = time_evolution(t_final, psi_0, I_amplitude)
-final_psi = time_evolution(t_final, psi_0, I_amplitude)
-
-# Compute expectation values
-def expectation_value(psi_t, sigma):
-    exp_values = []
-    for psi in psi_t.T:
-        psi = psi.reshape((2**N, 1))
-        exp_value = np.real(np.dot(psi.T.conj(), np.dot(np.kron(sigma, np.eye(2**(N-1))), psi)))
-        exp_values.append(exp_value)
-    return np.array(exp_values)
-
-expect_z = expectation_value(psi_t, sigma_z).flatten()
-expect_x = expectation_value(psi_t, sigma_x).flatten()
-
-# Plot the expectation value over time
-plt.plot(time, expect_z, label=r"$\langle \sigma_z \rangle$")
-plt.plot(time, expect_x, label=r"$\langle \sigma_x \rangle$")
-plt.xlabel("Time")
-plt.ylabel("Expectation Value")
+plt.figure(figsize=(8,4))
+for i in range(N):
+    plt.plot(t_pts, exp_x[:, i], label=f'Qubit {i+1}')
+plt.xlabel('Time')
+plt.ylabel(r'$\langle \sigma_x \rangle$')
+plt.title('Quantum RNN Qubit Expectations')
 plt.legend()
 plt.grid(True)
+plt.tight_layout()
 plt.show()
 
-# 1. Quantum State Norm over Time
-def plot_state_norm(time, psi_t):
-    norms = [np.linalg.norm(psi)**2 for psi in psi_t.T]
-    plt.plot(time, norms, label="State Norm")
-    plt.xlabel("Time")
-    plt.ylabel("Norm")
-    plt.title("Quantum State Norm over Time")
-    plt.grid(True)
-    plt.legend()
-    plt.show()
+import numpy as np
+import matplotlib.pyplot as plt
 
-# 2. Energy Expectation Value over Time
-def energy_expectation(time, psi_t, I_amplitude):
-    energy_vals = []
-    for i, psi in enumerate(psi_t.T):
-        psi = psi.reshape((2**N, 1))
-        H_t = H(time[i], I_amplitude)
-        energy = np.real(np.dot(psi.T.conj(), np.dot(H_t, psi)))
-        energy_vals.append(energy[0, 0])
-    plt.plot(time, energy_vals, label=r"$\langle H \rangle$")
-    plt.xlabel("Time")
-    plt.ylabel("Energy")
-    plt.title("Energy Expectation over Time")
-    plt.grid(True)
-    plt.legend()
-    plt.show()
+# … after evolution_results = qrnn.evolve(…) …
 
-# 3. Population of Each State over Time
-def plot_population(time, psi_t):
-    populations = np.abs(psi_t)**2
-    for i in range(2**N):
-        plt.plot(time, populations[i, :], label=f"State |{i:0{N}b}>")
+# Compute purity = Tr[ρ^2] at each time step
+purities = np.array([np.real((rho * rho).tr()) for rho in results])
+
+# Plot purity over time
+plt.figure(figsize=(8,4))
+plt.plot(t_pts, purities, color='tab:purple', lw=2)
+plt.xlabel('Time')
+plt.ylabel('Purity, Tr[$\\rho^2$]')
+plt.title('Quantum State Purity Over Time')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Assume you have:
+# - qrnn: your QuantumRNN instance
+# - t_pts: 1D numpy array of time points
+# - results: list of qutip.Qobj density matrices ρ(t)
+# - And a function H_t(rho, t) that returns the Hamiltonian at time t
+#   (e.g., qrnn._get_hamiltonian(rho, inputs(t)))
+
+# Compute energy expectation at each time
+energies = []
+for idx, rho in enumerate(results):
+    t = t_pts[idx]
+    # Rebuild inputs if needed:
+    inputs_t = inputs(t)                   # your time-dependent input fn
+    H = qrnn._get_hamiltonian(rho, inputs_t)
+    # <H> = Tr[ρ H]
+    energies.append(np.real((rho * H).tr()))
+
+# Plot
+plt.figure(figsize=(8, 4))
+plt.plot(t_pts, energies, color='tab:green', lw=2)
+plt.xlabel('Time')
+plt.ylabel(r'Energy Expectation $\langle H \rangle$')
+plt.title('Quantum RNN Energy Expectation Over Time')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+def plot_state_populations(results, t_pts, N):
+    """
+    Plots population of each computational basis state |i> over time.
+    """
+    num_states = 2**N
+    # Extract populations: diagonal elements of each rho
+    pop_matrix = np.array([rho.diag() for rho in results])  # shape (len(t_pts), num_states)
+
+    plt.figure(figsize=(8, 5))
+    for state_idx in range(num_states):
+        plt.plot(t_pts, pop_matrix[:, state_idx], label=f"|{state_idx:0{N}b}>")
     plt.xlabel("Time")
     plt.ylabel("Population")
-    plt.title("Population of Each State over Time")
-    plt.legend(loc='upper right', bbox_to_anchor=(1.2, 1))
+    plt.title("Time Evolution of Each Computational Basis State")
+    plt.legend(bbox_to_anchor=(1.0, 1.0))
     plt.grid(True)
+    plt.tight_layout()
     plt.show()
 
-# Run the simulation
-time, psi_t = time_evolution(t_final, psi_0, I_amplitude)
-
-# Plot each of the additional metrics
-plot_state_norm(time, psi_t)
-
-energy_expectation(time, psi_t, I_amplitude)
-
-plot_population(time, psi_t)
+# Usage example (after your evolution):
+N = 4
+plot_state_populations(results, t_pts, N)
