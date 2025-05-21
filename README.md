@@ -13,4 +13,4 @@ This repository contains code for implementing a Quantum Recurrent Neural Networ
 To use this code, simply clone the repository and ensure you have the necessary Python packages installed. You can install the required packages using:
 
 ```bash
-pip install numpy matplotlib scipy
+pip install numpy matplotlib scipy qutip
